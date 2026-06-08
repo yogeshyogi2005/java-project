@@ -1,0 +1,940 @@
+let [cos, sin] = [Math.cos.bind(Math), Math.sin.bind(Math)];
+
+let gameState = "menu";
+
+let enemyVel = null, planeVel = null, rollSpeed = null, pitchSpeed = null, enemyRollSpeed = null, enemyPitchSpeed = null, aimAssistRange = null, planeRadius = null, hp = null, enemyHP = null, pain = null, camLock = null, transitioningCamLock = null, FOVFactor = null;
+let bulletVel = null;
+let planeBaseVel = null;
+let enemyLeadsAim = null;
+let mapBoundaries = null;
+let gameActive = false;
+let currentLevel = 1;
+let enemyFollowTimer = 0;
+let enemyFollowDuration = 10; // Enemy follows for 10 seconds
+let enemyRestDuration = 20; // Then rests for 20 seconds (total 30 sec cycle)
+let enemyFollowing = true;
+
+let plane = null, enemy = null, map = null, fire = null;
+// ===== SOUNDS =====
+const engineSound = new Audio("assets/sounds/engine.mp3");
+engineSound.loop = true;
+engineSound.volume = 0.4;
+
+const shootSound = new Audio("assets/sounds/shoot.mp3");
+shootSound.volume = 0.7;
+
+function resetValues() {
+  // Adjust difficulty based on level
+  let levelMultiplier = 1 + (currentLevel - 1) * 0.2; // 20% harder each level
+  
+  enemyVel = 1.8 * Math.min(levelMultiplier, 1.5); // Max 50% faster at level 5
+  planeVel = 2; 
+  rollSpeed = 0.1; 
+  pitchSpeed = 0.04; 
+  enemyRollSpeed = 0.05 * levelMultiplier;
+  enemyPitchSpeed = 0.025 * levelMultiplier;
+  aimAssistRange = Math.PI/24; 
+  bulletVel = 4 * levelMultiplier;
+  planeRadius = 1.8; 
+  hp = 100; 
+  enemyHP = 50 + (currentLevel * 10); // More HP each level
+  pain = 0; 
+  camLock = false; 
+  transitioningCamLock = 0; 
+  FOVFactor = 1;
+  planeBaseVel = 1.5;
+  enemyLeadsAim = true;
+  enemyFollowTimer = 0;
+  enemyFollowing = true;
+  
+  shapes = []; 
+  bullets = [];
+  plane = copyShape(planeTemplate); 
+  shapes.push(plane); 
+  plane.move([0, 10, 0]);
+  map = copyShape(mapTemplate); 
+  shapes.push(map);
+  enemy = copyShape(enemyTemplate); 
+  enemy.moveInDirection(150);
+  enemy.update(Math.PI, "yaw");
+  shapes.push(enemy);
+  mapBoundaries = [
+    Math.max(...map.polys.map(poly => Math.max(...poly.map(pt => pt[0])))),
+    Math.min(...map.polys.map(poly => Math.min(...poly.map(pt => pt[0])))),
+    Math.max(...map.polys.map(poly => Math.max(...poly.map(pt => pt[2])))),
+    Math.min(...map.polys.map(poly => Math.min(...poly.map(pt => pt[2])))),
+    Math.max(...map.polys.map(poly => Math.max(...poly.map(pt => pt[1]))))
+  ];
+  gameActive = true;
+  camAngle = [0, 0, 0];
+  
+  // Start engine sound
+  engineSound.currentTime = 0;
+  engineSound.play().catch(e => console.log("Audio play failed:", e));
+}
+
+class matrix {
+  constructor(list) {
+    this.list = list;
+    this.dim = [this.list.length, this.list[0].length];
+  }
+  multiply(other) {
+    if (other.dim[0] !== this.dim[1]) return false;
+    let newMatrix = matrix.dimensions(this.dim[0], other.dim[1]);
+    for (let i = 0; i < this.dim[0]; i++) {
+      for (let j = 0; j < other.dim[1]; j++) {
+      	newMatrix.list[i][j] = this.list[i].map((el, idx) => el*other.list[idx][j]).reduce((a, b)=>a+b);
+      }
+    }
+    return newMatrix;
+  }
+  static from(list) {return new matrix(list);}
+  static dimensions(r, c) {
+    let list = [];
+    for (let i = 0; i < r; i++) {
+      list.push((new Array(c)).fill(0));
+    }
+    return new matrix(list);
+  }
+  static identity(n) {
+    let list = [];
+    for (let i = 0; i < n; i++) {
+      list.push([]);
+      for (let j = 0; j < n; j++) {
+        if (i === j) list.at(-1).push(1);
+        else list.at(-1).push(0);
+      }
+    }
+    return new matrix(list);
+  }
+}
+
+class Shape {
+  constructor(polys) {
+    this.polys = polys;
+    this.offset = [0, 0, 0];
+    this.rotate = [0, 0, 0];
+    this.speed = 0;
+    this.localFrame = {
+      "roll": [1, 0, 0],
+      "pitch": [0, 1, 0],
+      "yaw": [0, 0, 1]
+    }
+  }
+  move(offset) {
+    this.offset = this.offset.map((el, idx) => el+offset[idx]);
+    this.polys = this.polys.map(poly => {
+      let newPoly = poly.map(pt => pt.map((el, idx) => el+offset[idx]));
+      newPoly.mtl = poly.mtl;
+      newPoly.cross = poly.cross;
+      return newPoly;
+    });
+  }
+  moveInDirection(dist) {
+    this.move([dist*this.localFrame.roll[1], dist*this.localFrame.roll[2], dist*this.localFrame.roll[0]])
+  }
+  turn(direction) {
+    this.rotate = this.rotate.map((n, idx) => n + direction[idx]);
+  }
+  updateCrossProducts() {
+    for (let poly of this.polys) {
+      poly.cross = crossPoly(poly);
+    }
+  }
+  update(a, name) {
+    const rotationAxis = this.localFrame[name];
+    const pv = rotationAxis;
+    const [x, y, z] = pv;
+
+    const mc = (1 - cos(a));
+    const Q = [
+      x * x * mc + cos(a), x * y * mc - z * sin(a), x * z * mc + y * sin(a),
+      x * y * mc + z * sin(a), y * y * mc + cos(a), y * z * mc - x * sin(a),
+      x * z * mc - y * sin(a), y * z * mc + x * sin(a), z * z * mc + cos(a),
+    ];
+    this.localFrame.roll = mul(Q, this.localFrame.roll);
+    this.localFrame.pitch = mul(Q, this.localFrame.pitch);
+    this.localFrame.yaw = mul(Q, this.localFrame.yaw);
+    let offset = this.offset;
+    this.polys = this.polys.map(poly => {
+      let newPoly = poly.map(pt => mul(Q, [pt[2]-offset[2], pt[0]-offset[0], pt[1]-offset[1]]));
+      newPoly = newPoly.map(pt => [pt[1]+offset[0], pt[2]+offset[1], pt[0]+offset[2]]);
+      newPoly.mtl = poly.mtl;
+      newPoly.cross = poly.cross;
+      return newPoly;
+    });
+    this.updateCrossProducts();
+    if (name === "roll") {
+      this.rotate[2] += a;
+    }
+    this.rotate[1] = Math.atan2(this.localFrame.roll[2], Math.sqrt(this.localFrame.roll[0]**2+this.localFrame.roll[1]**2))
+    this.rotate[0] = (Math.atan2(this.localFrame.roll[1], (this.localFrame.roll[0])))
+  };
+}
+
+function mul(M, v) {
+   let x, y, z;
+   if (v.length === 3) {
+     x = v[0];
+     y = v[1];
+     z = v[2];
+   } else {
+     x = v.x;
+     y = v.y;
+     z = v.z;
+   }
+   return [
+     M[0] * x + M[1] * y + M[2] * z,
+     M[3] * x + M[4] * y + M[5] * z,
+     M[6] * x + M[7] * y + M[8] * z,
+   ];
+ }
+
+function crossProduct(vec1, vec2) {
+  return (matrix.from([[0, -vec1[2], vec1[1]], [vec1[2], 0, -vec1[0]], [-vec1[1], vec1[0], 0]])).multiply(matrix.from([[vec2[0]], [vec2[1]], [vec2[2]]]));
+}
+
+function crossPoly(pts) {
+  return unit(crossProduct([pts[1][0]-pts[0][0], pts[1][1]-pts[0][1], pts[1][2]-pts[0][2]], [pts[2][0]-pts[1][0], pts[2][1]-pts[1][1], pts[2][2]-pts[1][2]]).list.flat());
+}
+
+function dotProduct(vec1, vec2) {
+  return vec1.reduce((a, b, idx) => a+b*vec2[idx], 0);
+}
+
+function minus(pt1, pt2) {
+  return pt1.map((n, idx) => n-pt2[idx]);
+}
+
+function angleBetween(pt1, center, pt2) {
+  return Math.acos(Math.max(Math.min(1, dotProduct(unit(minus(pt1, center)), unit(minus(pt2, center)))), -1));
+}
+
+function center(list) {
+  return list.reduce((a, b) => a.map((el, idx) => el+b[idx]/list.length), [0,0,0]);
+}
+
+function unit(list) {
+  let dist = list.reduce((a, b) => a+b**2, 0)**0.5;
+  return list.map(n => n/dist);
+}
+
+function distance(pt1, pt2) {
+  return Math.sqrt(pt1.map((n, idx) => (n-pt2[idx])**2).reduce((a, b) => a+b));
+}
+
+function leadAim(initPos, targetPos, speed, targetVel) {
+  let collisionPos = targetPos, time = null;
+  for (let i = 0; i < 5; i++) {
+    time = Math.sqrt(collisionPos.map((n, idx) => (n-initPos[idx])**2).reduce((a, b) => a+b))/speed;
+    collisionPos = targetPos.map((n, idx) => n+targetVel[idx]*time);
+  }
+  return [unit(collisionPos.map((n, idx) => n-initPos[idx])), collisionPos];
+}
+
+function distInDir(dirVec, init, pt) {
+  if (init === null) init = [0, 0, 0];
+  return dotProduct(unit(dirVec), pt.map((n, idx) => n-init[idx]));
+}
+
+function ptHitsTri(pt, radius, tri) {
+  let centroid = center(tri);
+  let firstpoint = tri.reduce((a, b) => angleBetween(a, centroid, pt) < angleBetween(b, centroid, pt) ? a : b);
+  let previous = tri.at(tri.indexOf(firstpoint)-1);
+  if (Math.abs(angleBetween(previous, centroid, firstpoint) - (angleBetween(previous, centroid, pt)+angleBetween(pt, centroid, firstpoint))) < 0.001) {
+    secondpoint = previous;
+  } else {
+    secondpoint = tri.at(tri.indexOf(firstpoint)+1-tri.length);
+  }
+  let expectedDistance = Math.sin(angleBetween(centroid, firstpoint, secondpoint))*distance(centroid, firstpoint) / Math.sin(Math.PI-angleBetween(firstpoint, centroid, pt)-angleBetween(centroid, firstpoint, secondpoint));
+  if (distance(centroid, pt) <= expectedDistance) {
+    return 1;
+  }
+  if (radius === 0) return 0;
+  let distAlongSide = dotProduct(unit(minus(secondpoint, firstpoint)), minus(pt, firstpoint));
+  if (distAlongSide < 0) {
+    if (distance(firstpoint, pt) <= radius) return 2;
+  }
+  let expectedOuterDistance = distance(firstpoint, pt) * Math.sin(angleBetween(pt, firstpoint, secondpoint))
+  if (expectedOuterDistance <= radius) return 2;
+  return 0;
+}
+
+function sphereHitsPoly(sphereCenter, radius, poly) {
+  let trueCentroid = center(poly);
+  let verticalDist = distInDir(poly.cross, trueCentroid, sphereCenter);
+  if (Math.abs(verticalDist) < radius) {
+    let crossSection = radius*Math.cos(Math.asin(Math.abs(verticalDist/radius)));
+    if (poly.some(pt => distance(trueCentroid, pt) >= distance(trueCentroid, sphereCenter)-crossSection)) {
+      if (ptHitsTri(minus(sphereCenter, poly.cross.map(n => n*verticalDist)), crossSection, poly) !== 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+let camFollow = null;
+let points = [];
+let shapes = [];
+
+let canvas = document.querySelector("#canvas");
+let ctx = canvas.getContext("2d");
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+canvas.height = Number(getComputedStyle(document.body).height.replace("px", ""));
+if (ctx.roundRect === undefined) ctx.roundRect = ctx.rect;
+
+function circle(x, y, radius) {
+  ctx.arc(x, y, radius, 0, Math.PI*2);
+  ctx.fill();
+  ctx.closePath();
+}
+
+let camAngle = [0, 0, 0], camPos = [0, 0, 0];
+
+function project(point) {
+  return [point[0]/(point[2])*canvas.width/FOVFactor/2.5+canvas.width/2, -point[1]/Math.abs(point[2])*canvas.height/FOVFactor/1.8+canvas.height/2, Math.max(10/point[2], 0)];
+}
+
+function clear(canvas) {
+	let ctx = canvas.getContext("2d");
+	ctx.beginPath();
+	ctx.clearRect(0, 0, canvas.width, canvas.height);
+	ctx.closePath();
+}
+
+let lastTime = performance.now();
+
+setInterval(function() {
+  if (gameState === "playing" && !isLoading) {
+    if (keys["p"] || document.pointerLockElement === null || !document.hasFocus()) gameState = "justPaused";
+  }
+  if (gameState === "playing" && !isLoading) {
+    clear(canvas);
+    ctx.fillStyle = "skyblue";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "grey";
+    let cameraSpeed = 1, cameraDistance = 10;
+    camFollow = plane;
+    if (camFollow === null) {
+      if (keys["w"]) {
+        camPos[2] += Math.cos(camAngle[0]) * cameraSpeed * Math.cos(camAngle[1]);
+        camPos[0] += Math.sin(-camAngle[0]) * cameraSpeed * Math.cos(camAngle[1]);
+        camPos[1] += Math.sin(camAngle[1]) * cameraSpeed;
+      }
+      if (keys["s"]) {
+        camPos[2] -= Math.cos(camAngle[0]) * cameraSpeed * Math.cos(camAngle[1])
+        camPos[0] -= Math.sin(-camAngle[0]) * cameraSpeed * Math.cos(camAngle[1]);
+        camPos[1] -= Math.sin(camAngle[1]) * cameraSpeed;
+      }
+      if (keys["a"]) {
+        camPos[2] -= Math.sin(camAngle[0]) * cameraSpeed;
+        camPos[0] -= Math.cos(-camAngle[0]) * cameraSpeed;
+      }
+      if (keys["d"]) {
+        camPos[2] += Math.sin(camAngle[0]) * cameraSpeed;
+        camPos[0] += Math.cos(-camAngle[0]) * cameraSpeed;
+      }
+    } else {
+      if (keys["c"]) {camLock = !camLock; delete keys["c"]; transitioningCamLock = 5;}
+      if (keys["i"]) FOVFactor *= .95;
+      if (keys["o"]) FOVFactor /= .95;
+
+      if (camLock) {
+        if (transitioningCamLock > 0) {
+          camAngle[0] += (-plane.rotate[0]-camAngle[0]) * .6;
+          camAngle[1] += (plane.rotate[1]-camAngle[1]) * .6;
+        } else {
+          camAngle[0] = -plane.rotate[0];
+          camAngle[1] = plane.rotate[1];
+        }
+        let idealUpwardVector = [Math.sin(plane.rotate[0])*Math.cos(plane.rotate[1]+Math.PI/2), Math.sin(plane.rotate[1]+Math.PI/2), Math.cos(plane.rotate[0])*Math.cos(plane.rotate[1]+Math.PI/2)];
+        let forward = [plane.localFrame.roll[1], plane.localFrame.roll[2], plane.localFrame.roll[0]];
+        let sideways = [plane.localFrame.pitch[1], plane.localFrame.pitch[2], plane.localFrame.pitch[0]];
+        let up = [plane.localFrame.yaw[1], plane.localFrame.yaw[2], plane.localFrame.yaw[0]];
+
+        let flatRight = [forward[2], -forward[0]], flatUp = [up[0], up[2]];
+
+        if (transitioningCamLock > 0) {
+          camAngle[2] += (angleBetween(up, [0, 0, 0], idealUpwardVector) * (distInDir(flatRight, [0, 0], flatUp) >= 0 ? 1 : -1) - camAngle[2]) * .6;
+        } else {
+          camAngle[2] = angleBetween(up, [0, 0, 0], idealUpwardVector) * (distInDir(flatRight, [0, 0], flatUp) >= 0 ? 1 : -1);
+        }
+        transitioningCamLock -= 1;
+        let upCamOffset = unit(up).map(n => n*cameraDistance/5);
+        let sidewaysOffset = unit(sideways).map(n => n*cameraDistance/10);
+        upCamOffset = upCamOffset.map((n, idx) => n+sidewaysOffset[idx]);
+        camPos[0] = camFollow.offset[0] + Math.sin(camAngle[0]) * cameraDistance/2 * Math.cos(camAngle[1]) + upCamOffset[0];
+        camPos[1] = camFollow.offset[1] - Math.sin(camAngle[1]) * cameraDistance/2 + upCamOffset[1];
+        camPos[2] = camFollow.offset[2] - Math.cos(camAngle[0]) * cameraDistance/2 * Math.cos(camAngle[1]) + upCamOffset[2];
+      } else {
+        camAngle[2] *= 0.5;
+        camPos[0] = camFollow.offset[0] + Math.sin(camAngle[0]) * cameraDistance * Math.cos(camAngle[1]);
+        camPos[1] = camFollow.offset[1] - Math.sin(camAngle[1]) * cameraDistance + cameraDistance/5;
+        camPos[2] = camFollow.offset[2] - Math.cos(camAngle[0]) * cameraDistance * Math.cos(camAngle[1]);
+      }
+    }
+
+    let yaw = matrix.from([[Math.cos(camAngle[2]), -Math.sin(camAngle[2]), 0], [Math.sin(camAngle[2]), Math.cos(camAngle[2]), 0], [0, 0, 1]]);
+    let roll = matrix.from([[1, 0, 0], [0, Math.cos(camAngle[1]), -Math.sin(camAngle[1])], [0, Math.sin(camAngle[1]), Math.cos(camAngle[1])]]);
+    let pitch = matrix.from([[Math.cos(camAngle[0]), 0, Math.sin(camAngle[0])], [0, 1, 0], [-Math.sin(camAngle[0]), 0, Math.cos(camAngle[0])]]);
+    let transformCamera = yaw.multiply(roll).multiply(pitch);
+    points = []
+
+    let renderList = [];
+    for (let shape of shapes) {
+      let rotationX = matrix.from([[Math.cos(shape.rotate[2]), -Math.sin(shape.rotate[2]), 0], [Math.sin(shape.rotate[2]), Math.cos(shape.rotate[2]), 0], [0, 0, 1]]);
+      let rotationY = matrix.from([[Math.cos(shape.rotate[0]), 0, Math.sin(shape.rotate[0])], [0, 1, 0], [-Math.sin(shape.rotate[0]), 0, Math.cos(shape.rotate[0])]]);
+      let rotationZ = matrix.from([[1, 0, 0], [0, Math.cos(-shape.rotate[1]), -Math.sin(-shape.rotate[1])], [0, Math.sin(-shape.rotate[1]), Math.cos(-shape.rotate[1])]]);
+      let transformCache = new Map();
+      for (let poly of shape.polys) {
+        let pts = poly.map(pt => [[pt[0]-shape.offset[0]], [pt[1]-shape.offset[1]], [pt[2]-shape.offset[2]]]);
+        let cross = poly.cross;
+        let dist = distance(center(pts), camPos);
+        let dot = dotProduct(cross, unit([.5, -1, 0]));
+
+        let cameraDot = dotProduct(cross, unit([pts[1][0]-camPos[0]+shape.offset[0], pts[1][1]-camPos[1]+shape.offset[1], pts[1][2]-camPos[2]+shape.offset[2]]));
+        pts = pts.map(pt => {
+          let str = JSON.stringify(pt);
+          if (transformCache.has(str)) {
+            return transformCache.get(str)
+          } else {
+            let transformed = transformCamera.multiply(matrix.from([[pt[0]-camPos[0]+shape.offset[0]], [pt[1]-camPos[1]+shape.offset[1]], [pt[2]-camPos[2]+shape.offset[2]]])).list;
+            transformCache.set(str, transformed);
+            return transformed;
+          }
+        });
+        if (pts.some(pt => pt[2] < 0)) {
+          if (pts.filter(pt => pt[2] > 0).length >= 1) {
+            pts = pts.map(pt => pt[2] <= 0 ? [pt[0], pt[1], Math.abs(pt[2])*.1] : pt);
+          } else continue;
+        }
+        let centroid = center(pts);
+        
+        if (cameraDot > 0) dot = -dot;
+        let rgb = null;
+        if (poly.mtl in materials) rgb = materials[poly.mtl];
+        else rgb = [128, 128, 128];
+        rgb = rgb.map(n => n*(1-dot/3) + 1/7*dist);
+        pts.mtl = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+        pts.meanZ = Math.sqrt((centroid[0])**2+(centroid[1])**2+(centroid[2])**2);
+        renderList.push(pts);
+      }
+    }
+    renderList.sort((a, b) => b.meanZ-a.meanZ);
+    for (let pts of renderList) {
+      ctx.fillStyle = pts.mtl;
+      ctx.strokeStyle = pts.mtl;
+      ctx.lineWidth = 0;
+      pts = pts.map(project)
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i][0], pts[i][1]);
+      }
+      ctx.closePath();
+
+      ctx.stroke();
+      ctx.fill();
+    }
+    if (gameActive) {
+      if (keys["arrowleft"] || keys["a"]) {
+        plane.update(rollSpeed, "roll")
+      }
+      if (keys["arrowright"] || keys["d"]) {
+        plane.update(-rollSpeed, "roll")
+      }
+      if (keys["arrowup"] || keys["w"]) {
+        plane.update(pitchSpeed*.7*(planeVel/planeBaseVel), "pitch")
+      }
+      if (keys["arrowdown"] || keys["s"]) {
+        plane.update(-pitchSpeed*(planeVel/planeBaseVel), "pitch")
+      }
+      if (keys[" "]) {
+        spawnShot(plane, true);
+      }
+      
+      plane.moveInDirection(planeVel);
+      enemy.moveInDirection(enemyVel);
+      
+      // Update enemy follow timer
+      enemyFollowTimer += 0.02; // Approximately 20ms per frame
+      
+      // Check if we should toggle following state
+      if (enemyFollowing && enemyFollowTimer >= enemyFollowDuration) {
+        enemyFollowing = false;
+        enemyFollowTimer = 0;
+      } else if (!enemyFollowing && enemyFollowTimer >= enemyRestDuration) {
+        enemyFollowing = true;
+        enemyFollowTimer = 0;
+      }
+      
+      // Draw enemy follow status
+      let followStatus = enemyFollowing ? "ENEMY FOLLOWING!" : "ENEMY RESTING - ATTACK NOW!";
+      let statusColor = enemyFollowing ? "red" : "green";
+      drawText(ctx, followStatus, canvas.width/2, 60, 20, statusColor, "center", "Arial");
+      
+      let enemyAboutToCrash = false;
+      if (enemy.offset[0] > mapBoundaries[0] || enemy.offset[0] < mapBoundaries[1] || enemy.offset[2] > mapBoundaries[2] || 
+      enemy.offset[2] < mapBoundaries[3]) {
+        if (enemy.offset[1] < mapBoundaries[4]) enemyAboutToCrash = true;
+      }
+      for (let poly of map.polys) {
+        if (sphereHitsPoly(plane.offset, planeRadius, poly)) {
+          hp = 0;
+          pain += 1;
+        }
+        if (sphereHitsPoly(enemy.offset, 1.8, poly)) {
+          enemyHP = 0;
+        }
+        if (!enemyAboutToCrash && sphereHitsPoly(enemy.offset.map((n, idx) => [enemy.localFrame.roll[1], enemy.localFrame.roll[2], enemy.localFrame.roll[0]][idx]*50+n), 30, poly)) {
+          enemyAboutToCrash = true;
+        }
+      }
+
+      planeVel += Math.sin(plane.localFrame.roll[2] * -0.015);
+      planeVel += (planeBaseVel-planeVel)/50;
+      if (plane.offset[0] > mapBoundaries[0] || plane.offset[0] < mapBoundaries[1] || plane.offset[2] > mapBoundaries[2] || 
+      plane.offset[2] < mapBoundaries[3]) {
+        hp -= 0.03;
+        pain += .052;
+        drawText(ctx, "Return to battlefield", canvas.width/2, 30, 30, "red", "center", "georgia");
+      }
+      
+      for (let bullet of bullets) {
+        bullet.moveInDirection(bulletVel);
+        bullet.distance += bulletVel;
+        if (distance(bullet.offset, plane.offset) < planeRadius) {
+          hp -= 5;
+          pain += 0.2;
+        }
+        if (distance(bullet.offset, enemy.offset) < planeRadius*1.5) {
+          enemyHP -= 5;
+          ctx.drawImage(hitMarker, canvas.width/2+100, canvas.height/2-25, 50, 50);
+        }
+        if (bullet.distance > 200 || distance(bullet.offset, enemy.offset) < planeRadius * 1.5 || distance(bullet.offset, plane.offset) < planeRadius) {
+          bullets.splice(bullets.indexOf(bullet), 1);
+          shapes.splice(shapes.indexOf(bullet), 1);
+        }
+      }
+
+      function perp(vec) {
+          if (vec[1] === 0) return [0, Math.abs(vec[0])/vec[0]]
+          return unit([1,-vec[0]/vec[1]])
+      }
+      if (enemyAboutToCrash) {
+        enemy.update(enemyPitchSpeed * 1.25 * (enemy.localFrame.yaw[2] > 0 ? -1 : 1), "pitch")
+        let perpendicular = perp([enemy.localFrame.roll[1], enemy.localFrame.roll[0]]);
+        let distSideways = distInDir([perpendicular[0], 0, perpendicular[1]], null, [enemy.localFrame.yaw[1], enemy.localFrame.yaw[2], enemy.localFrame.yaw[0]]);
+        if (distSideways !== 0) {
+          if (distSideways > 0 === enemy.localFrame.roll[0] > 0) 
+          enemy.update(enemyRollSpeed, "roll"); else enemy.update(-enemyRollSpeed, "roll");
+        }
+      } else {
+        // Only follow player if enemyFollowing is true
+        if (enemyFollowing) {
+          let target = enemyLeadsAim ? leadAim(enemy.offset, plane.offset, bulletVel*1.5, [plane.localFrame.roll[1], plane.localFrame.roll[2], plane.localFrame.roll[0]].map(n=>n*planeVel))[1] : plane.offset;
+          let overallAngle = dotProduct(unit([enemy.localFrame.roll[1], enemy.localFrame.roll[2], enemy.localFrame.roll[0]]), unit(target.map((n, idx) => n-enemy.offset[idx])));
+          let totalDist = Math.sqrt(plane.offset.map((n, idx) => (n-enemy.offset[idx])**2).reduce((a, b) => a+b));
+          if (overallAngle < .9999) {
+            let distSide = distInDir([enemy.localFrame.pitch[1], enemy.localFrame.pitch[2], enemy.localFrame.pitch[0]], enemy.offset, target);
+            let distVert = distInDir([enemy.localFrame.yaw[1], enemy.localFrame.yaw[2], enemy.localFrame.yaw[0]], enemy.offset, target);
+            let distFront = distInDir([enemy.localFrame.roll[1], enemy.localFrame.roll[2], enemy.localFrame.roll[0]], enemy.offset, target);
+            let angle = Math.atan2(distVert, distSide);
+            let vertAngle = Math.atan2(distVert, distFront);
+            if (Math.abs(angle-Math.PI/2) < enemyRollSpeed) {
+              enemy.update(angle-Math.PI/2, "roll");
+              enemy.update(Math.max(-enemyPitchSpeed,-vertAngle), "pitch")
+            } else if (distSide > 0) enemy.update(-enemyRollSpeed, "roll");
+            else if (distSide < 0) enemy.update(enemyRollSpeed, "roll");
+          }
+          if (totalDist < 50 && Math.acos(overallAngle) < aimAssistRange) spawnShot(enemy);
+        }
+      }
+    }
+    let difference = performance.now()-lastTime;
+    lastTime = performance.now();
+    drawText(ctx, "FPS: " + Math.round(1000/difference), canvas.width-57, canvas.height-12, 15, "black", "left");
+    
+    // Draw level info
+    drawText(ctx, "Level: " + currentLevel, 60, 30, 20, "blue", "left", "Arial");
+
+    let hpColor = `rgb(${Math.min((100-hp)*255/50, 255)}, ${Math.min(hp*255/50, 255)}, 0)`;
+    ctx.beginPath();
+    ctx.fillStyle = "black";
+    ctx.strokeWidth = 5;
+    ctx.roundRect(canvas.width-103, 17, 86, 16, 8);
+    ctx.fill();
+    ctx.closePath();
+    ctx.beginPath();
+    ctx.fillStyle = hpColor;
+    ctx.roundRect(canvas.width-100, 20, Math.max(80*hp/100, 2), 10, 5);
+    ctx.fill();
+    
+    // Draw enemy HP bar
+    let enemyHPColor = `rgb(${Math.min((100-enemyHP)*255/50, 255)}, ${Math.min(enemyHP*255/50, 255)}, 0)`;
+    ctx.beginPath();
+    ctx.fillStyle = "black";
+    ctx.strokeWidth = 5;
+    ctx.roundRect(canvas.width-103, 47, 86, 16, 8);
+    ctx.fill();
+    ctx.closePath();
+    ctx.beginPath();
+    ctx.fillStyle = enemyHPColor;
+    ctx.roundRect(canvas.width-100, 50, Math.max(80*enemyHP/(50 + currentLevel * 10), 2), 10, 5);
+    ctx.fill();
+    drawText(ctx, "Enemy HP", canvas.width-60, 45, 12, "white", "left");
+
+    pain = gameActive ? Math.min(pain, .4) : pain;
+    ctx.fillStyle = pain >= 0 ? `rgba(255, 0, 0, ${pain})` : `rgba(0, 255, 0, ${-pain})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    pain = gameActive ? Math.max(pain-0.05, 0) : pain;
+
+    if (gameActive) {
+      if (hp <= 0) {
+        fire = copyShape(fireTemplate);
+        fire.move(minus(plane.offset, fire.offset))
+        shapes.push(fire); 
+        gameActive = false; 
+        resume.visible = false;
+        pain = .4;
+        
+        // Stop engine sound on death
+        engineSound.pause();
+        engineSound.currentTime = 0;
+      }
+      if (enemyHP <= 0) {
+        fire = copyShape(fireTemplate);
+        fire.move(minus(enemy.offset, fire.offset));
+        shapes.push(fire); 
+        gameActive = false; 
+        resume.visible = false;
+        pain = 0;
+        
+        // Stop engine sound on win
+        engineSound.pause();
+        engineSound.currentTime = 0;
+      }
+    } else {
+      if (hp <= 0) {
+        pain += 0.01;
+        ctx.globalAlpha = Math.min(pain, .8);
+        drawText(ctx, "You Died!", canvas.width/2, 50, 50, "black", "center", "Georgia");
+        drawText(ctx, "Press 'm' to return to menu", canvas.width/2, 110, 25, "black", "center", "Georgia");
+        ctx.globalAlpha = 1;
+        if (pain >= 1) {gameState = "menu"; document.exitPointerLock();}
+      }
+      if (enemyHP <= 0) {
+        pain -= 0.02;
+        ctx.globalAlpha = -Math.max(pain, -.8);
+        drawText(ctx, "Level " + currentLevel + " Complete!", canvas.width/2, 50, 50, "black", "center", "Georgia");
+        if (currentLevel < 5) {
+          drawText(ctx, "Press 'n' for Next Level", canvas.width/2, 110, 25, "black", "center", "Georgia");
+        } else {
+          drawText(ctx, "You Completed All Levels!", canvas.width/2, 110, 25, "black", "center", "Georgia");
+        }
+        ctx.globalAlpha = 1;
+        if (pain <= -1) {
+          gameState = "menu"; 
+          document.exitPointerLock();
+        }
+      }
+    }    
+  }
+  
+  // Check for next level key
+  if (gameState === "playing" && !gameActive && enemyHP <= 0 && keys["n"] && currentLevel < 5) {
+    currentLevel++;
+    resetValues();
+    gameState = "playing";
+    resume.visible = true;
+    delete keys["n"];
+  }
+  
+  canvas.style.cursor = "auto";
+  if (gameState === "paused") {
+    if (mouseDown) {
+      (async function() {
+        await canvas.requestPointerLock();
+        if (document.pointerLockElement === canvas) {
+          gameState = "playing";
+          // Resume engine sound when unpausing
+          engineSound.play().catch(e => console.log("Audio resume failed:", e));
+        }
+      })();
+    }
+  }
+  if (gameState === "justPaused") {
+    document.exitPointerLock();
+    gameState = "paused";
+    
+    // Pause engine sound when game is paused
+    engineSound.pause();
+    
+    ctx.fillStyle = "rgba(175, 175, 175, 0.8)";
+    ctx.beginPath();
+    ctx.roundRect(canvas.width/2-150, canvas.height/2-150, 300, 150, 5);
+    ctx.fill();
+    drawText(ctx, "Paused!", canvas.width/2, canvas.height/2-100, 40, "black", "center", "Helvetica");
+    drawText(ctx, "Click anywhere to resume", canvas.width/2, canvas.height/2-60, 20, "black", "center", "Helvetica");
+    drawText(ctx, "Press 'm' to return to the menu", canvas.width/2, canvas.height/2-30,  20, "black", "center", "Helvetica");
+  }
+  if ((gameState === "playing" || gameState === "paused") && keys["m"]) {
+    gameState = "menu";
+    document.exitPointerLock();
+    
+    // Stop all sounds when returning to menu
+    engineSound.pause();
+    engineSound.currentTime = 0;
+    shootSound.pause();
+    shootSound.currentTime = 0;
+  }
+  if (gameState === "menu" || gameState === "instructions") {
+    clear(canvas);
+    ctx.fillStyle = "lightblue";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (gameState === "menu") {
+      let [width, height] = [getComputedStyle(canvas).width.replace("px", ""), getComputedStyle(canvas).height.replace("px", "")].map(Number);
+      ctx.drawImage(thumbnail, width/2-(width+50)/2-(mouseX-50)/2, height/2 - (height+50)/2-(mouseY-50)/2, width+50, height+50);
+      ctx.drawImage(logo, canvas.width/2-logo.width/2, 30, logo.width, logo.height);
+      
+      // Draw current level
+      drawText(ctx, "Current Level: " + currentLevel, canvas.width/2, 100, 25, "black", "center", "Arial");
+    }
+    for (let button of Button.buttons) {
+      if (button.visible && button.props.targetScreen === gameState) {
+        button.draw();
+        if (mouseDown && button.isHovering(mouseX, mouseY)) button.props.event();
+      }
+    }
+  }
+  
+  if (gameState === "instructions") {
+    drawText(ctx, "Instructions", canvas.width/2, 30, 40, "black", "center", "Helvetica");
+    drawText(ctx, "Use WASD to turn and aim your plane and space to shoot", canvas.width/2, 70, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Use mouse to turn camera", canvas.width/2, 98, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Press 'c' to lock/unlock the camera", canvas.width/2, 126, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Press i/o to zoom in/out", canvas.width/2, 154, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Enemy follows for 10 sec, then rests for 20 sec", canvas.width/2, 182, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Attack when enemy is resting!", canvas.width/2, 210, 20, "black", "center", "Trebuchet MS");
+    drawText(ctx, "Complete 5 levels to win", canvas.width/2, 238, 20, "black", "center", "Trebuchet MS");
+  }
+}, 20);
+
+let bullets = [];
+function spawnShot(from, target=false) {
+  let shot = copyShape(bullet);
+  shot.update(from.rotate[0], "yaw");
+  shot.update(-from.rotate[1], "pitch");
+  shot.move(from.offset.map((n, idx) => n-shot.offset[idx]));
+  shot.moveInDirection(2+Math.random()-.5);
+  shot.distance = 0;
+  shapes.push(shot);
+  bullets.push(shot);
+  
+  // Play shooting sound
+  shootSound.currentTime = 0;
+  shootSound.play().catch(e => console.log("Shoot sound failed:", e));
+  
+  if (target && enemy !== null) {
+    let lead = leadAim(plane.offset, enemy.offset, bulletVel, [enemy.localFrame.roll[1], enemy.localFrame.roll[2], enemy.localFrame.roll[0]].map(n=>n*enemyVel));
+    let currentAim = [plane.localFrame.roll[1], plane.localFrame.roll[2], plane.localFrame.roll[0]];
+    if (Math.acos(dotProduct(unit(lead[1].map((n, idx) => n-plane.offset[idx])), currentAim)) < aimAssistRange) {
+      shot.localFrame.roll = [lead[0][2], lead[0][0], lead[0][1]];
+    }
+  }
+  shot.localFrame.roll = unit(shot.localFrame.roll.map(n => n+(Math.random()-0.5)*0.05));
+}
+
+canvas.addEventListener("mousemove", function(e) {
+  if (gameState === "playing") {
+    camAngle[0] -= e.movementX/200;
+    camAngle[1] = Math.max(Math.min(camAngle[1]-e.movementY/200, Math.PI/2), -Math.PI/2);
+  } else {
+    let bd = canvas.getBoundingClientRect();
+    let mousePos = [(e.clientX - bd.left)*canvas.width/Number(getComputedStyle(canvas).width.replace("px", "")), (e.clientY - bd.top)*canvas.height/Number(getComputedStyle(canvas).height.replace("px", ""))];
+    mouseX = mousePos[0]/canvas.width*100; 
+    mouseY = mousePos[1]/canvas.height*100;
+  }
+});
+
+canvas.addEventListener("mousedown", function(e) {
+  if (e.buttons !== 1) {e.preventDefault(); e.stopPropagation();return;}
+  mouseDown = true;
+});
+
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("mouseup", function() {
+  mouseDown = false;
+});
+
+class Button {
+	static buttons = [];
+	constructor(left, top, width, height, fill, text, targetScreen, event=function(){}) {
+		this.props = {left, top, width, height, fill, text, targetScreen, event};
+		Button.buttons.push(this);
+		this.visible = true;
+	}
+	isHovering(x, y) {
+		return this.visible && x >= this.props.left && x <= this.props.left + this.props.width && y >= this.props.top && y <= this.props.top + this.props.height;
+	}
+	draw() {
+		ctx.beginPath();
+		ctx.fillStyle = this.isHovering(mouseX, mouseY) ? "grey" : this.props.fill;
+		ctx.roundRect(this.props.left*canvas.width/100, this.props.top*canvas.height/100, this.props.width*canvas.width/100, this.props.height*canvas.height/100, 3);
+		ctx.fill();
+		ctx.textAlign = "center";
+		ctx.textBaseline = 'middle';
+		drawText(ctx, this.props.text.value, (this.props.left+this.props.width/2)*canvas.width/100, 
+      (this.props.top+this.props.height/2)*canvas.height/100, this.props.text.size, "black", "center", this.props.text.font);
+		ctx.textBaseline = 'alphabetic';
+		if (this.isHovering(mouseX, mouseY)) canvas.style.cursor = ("pointer");
+	}
+}
+
+// CORRECT SIDE-BY-SIDE BUTTON POSITIONING
+let play = new Button(30, 70, 15, 10, "rgb(150, 150, 150)", {value:"Level " + currentLevel, font:"Courier, monospace", size:18}, "menu", async function() {
+  await canvas.requestPointerLock();
+  if (document.pointerLockElement === canvas) {
+    resetValues();
+    gameState = "playing";
+  }
+});
+
+let nextLevelBtn = new Button(50, 70, 15, 10, "rgb(150, 150, 150)", {value:"Next Level", font:"Courier, monospace", size:18}, "menu", async function() {
+  if (currentLevel < 5) {
+    currentLevel++;
+    this.props.text.value = "Level " + currentLevel;
+    await canvas.requestPointerLock();
+    if (document.pointerLockElement === canvas) {
+      resetValues();
+      gameState = "playing";
+    }
+  }
+});
+
+let instructions = new Button(70, 70, 15, 10, "rgb(150, 150, 150)", {value:"Instructions", font:"Courier, monospace", size:18}, "menu", function() {
+  gameState = "instructions";
+  mouseDown = false;
+});
+
+let backhome2 = new Button(42.5, 85, 15, 10, "rgb(150, 150, 150)", {value:"Home", font:"Courier, monospace", size:18}, "instructions", function() {
+  gameState = "menu";
+  mouseDown = false;
+});
+
+let thumbnail = new Image();
+thumbnail.src = "assets/thumb_blurred.png";
+let logo = new Image();
+logo.src = "assets/logo.png";
+let hitMarker = new Image();
+hitMarker.src = "assets/crosshair.svg";
+
+function drawText(ctx, text, x, y, size=10, color="black", align="center", font="Arial") {
+  ctx.fillStyle = color;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = align;
+  ctx.font = size + "px " + font;
+  ctx.fillText(text, x, y);
+}
+
+let fileInput = document.querySelector("input[type=file]");
+if (fileInput !== null) {
+  fileInput.addEventListener("input", async function(e) {
+    let fileType = this.files[0].name.match(/\.(\w+)$/)[1];
+    let reader = new FileReader();
+    reader.readAsText(this.files[0])
+    reader.onload = () => {
+      if (fileType === "obj") shapes.push(processObj(reader.result));
+      else if (fileType === "mtl") processMtl(reader.result);
+    }
+  });
+}
+
+function copyShape(shape) {
+  let newShape = new Shape([]);
+  for (let poly of shape.polys) {
+    let newPoly = poly.map(pt => pt.map(n=>n));
+    newPoly.mtl = poly.mtl;
+    newShape.polys.push(newPoly);
+  }
+  newShape.updateCrossProducts();
+  return newShape;
+}
+
+function processObj(text) {
+  let vertices = text.match(/\nv (.+?) (.+?) (.+)/g);
+  vertices = vertices.map(vertex => vertex.match(/ ([-\.\d]+)/g).map(Number));
+  let shape = new Shape([]);
+  let materialSections = text.match(/(usemtl .+)(\n|\r)+((?!usemtl).+?(\n|\r)?)+/g) || [text];
+  for (let materialSection of materialSections) {
+    let mtl = materialSection.match(/usemtl (.+)(\n|\r)/)?.[1];
+    let polys = materialSection.match(/(\n|\r)f (\d+\/\d+\/\d+ ?)+/g);
+
+    for (let poly of polys) {
+      let pts = poly.match(/ \d+/g).map(pt => vertices[Number(pt)-1].map(n=>n));
+      pts.mtl = mtl;
+      shape.polys.push(pts);
+    }
+  }
+  shape.offset = center(shape.polys.map(center))
+  shape.updateCrossProducts();
+  return shape;
+}
+
+let materials = {};
+function processMtl(text) {
+  let mtls = text.match(/[\n^]*newmtl ((.+)\n)+/g);
+  for (let material of mtls) {
+    let name = material.match(/[\n^] *newmtl (.+)\n/)[1];
+    let color = material.match(/\n *Kd ((\d\.?\d*[ \n]){3})/)[1].split(" ").map(n=>256*Number(n));
+    materials[name] = color;
+  }
+}
+
+let keys = {};
+let mouseDown = false;
+let mouseX = 0, mouseY = 0;
+document.addEventListener("keydown", function(e) {
+  if (!engineSound.playing) {
+    engineSound.play().catch(() => {});
+  }
+	keys[e.key.toLowerCase()] = true;
+});
+
+document.addEventListener("keyup", function(e) {
+	delete keys[e.key.toLowerCase()];
+});
+
+["bullet", "plane", "map", "enemy", "fire"].forEach(name => {
+  fetch("assets/" + name + ".mtl").then(res => res.text()).then(mtl => {
+    processMtl(mtl);
+  });
+});
+
+let planeTemplate = null, mapTemplate = null, bullet = null, enemyTemplate = null, fireTemplate = null;
+Object.defineProperty(window, "isLoading", {
+  get() {return [planeTemplate, mapTemplate, bullet, enemyTemplate, fireTemplate].some(template => template === null);},
+});
+
+fetch("assets/plane.obj").then(res => res.text()).then(obj => {
+  planeTemplate = processObj(obj);
+  if (!isLoading) resetValues();
+});
+fetch("assets/bullet.obj").then(res => res.text()).then(obj => {
+  bullet = processObj(obj);
+  if (!isLoading) resetValues();
+});
+fetch("assets/map.obj").then(res => res.text()).then(obj => {
+  mapTemplate = processObj(obj);
+  if (!isLoading) resetValues();
+});
+fetch("assets/enemy.obj").then(res => res.text()).then(obj => {
+  enemyTemplate = processObj(obj);
+  if (!isLoading) resetValues();
+});
+fetch("assets/fire.obj").then(res => res.text()).then(obj => {
+  fireTemplate = processObj(obj);
+  if (!isLoading) resetValues();
+});
